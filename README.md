@@ -47,3 +47,19 @@ The main screen now shows only the most important analyst information:
 
 Detailed TCP, TLS, HTTP, flow, source, destination, and port statistics are
 still available inside expandable sections.
+
+
+## v0.5
+- Main traffic destination IP
+- Reverse DNS hostname when available
+- Destination concentration by packets, flows, and payload
+- Early attack conclusion with confidence and evidence
+- Dashboard glossary
+
+
+## v0.6 classifier fix
+- SYN count alone no longer triggers a SYN Flood conclusion.
+- Application-bearing traffic is evaluated before SYN behavior.
+- SYN Flood now requires SYN-dominant traffic with little ACK, PSH, TLS application data, HTTP activity, and TCP payload.
+- Added Possible Web / Layer 7 DDoS classification when substantial application-bearing traffic is concentrated on one destination.
+- This change addresses the false SYN Flood classification observed in the known Web DDoS test capture.

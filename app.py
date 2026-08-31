@@ -135,6 +135,205 @@ def open_capture(path):
         raise ValueError("The file could not be parsed as PCAP or PCAPNG.")
 
 
+
+def reverse_dns(ip):
+    try:
+        host, aliases, addresses = socket.gethostbyaddr(ip)
+        return host
+    except Exception:
+        return None
+
+
+def classify_attack(stats, target):
+    """
+    Conservative rule-based attack assessment.
+
+    Important change in v0.6:
+    A high SYN count alone is NOT enough to classify a SYN flood.
+    Application-bearing traffic is evaluated first.
+    """
+
+    total_flows = max(stats.get("tcp_flows", 0), 1)
+    tcp_packets = max(stats.get("tcp_packets", 0), 1)
+
+    low_data = stats.get("low_data_flows", 0)
+    existing = stats.get("established_before_capture", 0)
+    syns = stats.get("syn_packets", 0)
+    syn_acks = stats.get("syn_ack_packets", 0)
+    acks = stats.get("ack_packets", 0)
+    psh = stats.get("psh_packets", 0)
+    client_hellos = stats.get("client_hellos", 0)
+    tls_app_packets = stats.get("tls_application_data_packets", 0)
+    http_requests = stats.get("http_requests", 0)
+    active = stats.get("active_application_flows", 0)
+    payload_bytes = stats.get("tcp_payload_bytes", 0)
+
+    low_ratio = low_data / total_flows
+    existing_ratio = existing / total_flows
+    syn_ratio = syns / tcp_packets
+    ack_ratio = acks / tcp_packets
+    psh_ratio = psh / tcp_packets
+
+    target_packet_share = target.get("packet_share_pct", 0)
+    target_flow_share = target.get("flow_share_pct", 0)
+    target_payload_share = target.get("payload_share_pct", 0)
+
+    # ----------------------------------------------------
+    # 1. Application-bearing / web traffic first
+    # ----------------------------------------------------
+    # A web attack can naturally create many new TCP connections.
+    # Therefore SYN volume must not override strong evidence that
+    # traffic is progressing into application-bearing TCP sessions.
+    strong_application_evidence = (
+        tls_app_packets >= 50
+        or http_requests >= 50
+        or psh_ratio >= 0.15
+        or (
+            payload_bytes >= 1_000_000
+            and ack_ratio >= 0.50
+        )
+    )
+
+    strongly_targeted = max(
+        target_packet_share,
+        target_flow_share,
+        target_payload_share,
+    ) >= 70
+
+    if strong_application_evidence and strongly_targeted:
+        evidence = [
+            f"{payload_bytes:,} bytes of TCP payload observed",
+            f"{acks:,} ACK packets and {psh:,} PSH packets observed",
+            f"{tls_app_packets:,} TLS Application Data packets observed",
+            f"{http_requests:,} visible HTTP requests observed",
+            f"{target_packet_share:.1f}% of packets target the main destination",
+        ]
+
+        return {
+            "name": "Possible Web / Layer 7 DDoS",
+            "confidence": "High" if target_packet_share >= 90 else "Medium",
+            "summary": (
+                "Traffic progresses beyond TCP connection setup and carries "
+                "substantial application-bearing data toward one main destination. "
+                "The SYN packets are treated as connection setup for this traffic, "
+                "not as proof of a SYN flood."
+            ),
+            "evidence": evidence,
+        }
+
+    # ----------------------------------------------------
+    # 2. TLS ClientHello-heavy behavior
+    # ----------------------------------------------------
+    if (
+        client_hellos >= 100
+        and client_hellos / total_flows >= 0.30
+        and tls_app_packets < client_hellos * 0.20
+    ):
+        return {
+            "name": "Possible TLS ClientHello Flood",
+            "confidence": "Medium",
+            "summary": (
+                "A large share of flows starts TLS negotiation, while relatively "
+                "little TLS application data is observed."
+            ),
+            "evidence": [
+                f"{client_hellos:,} ClientHello packets",
+                f"{tls_app_packets:,} TLS Application Data packets",
+                f"{target_flow_share:.1f}% of TCP flows target the main destination",
+            ],
+        }
+
+    # ----------------------------------------------------
+    # 3. Low-data / connection-holding behavior
+    # ----------------------------------------------------
+    if total_flows >= 100 and low_ratio >= 0.70 and existing_ratio >= 0.50:
+        return {
+            "name": "Possible Low-Data Connection Flood",
+            "confidence": "High" if low_ratio >= 0.90 else "Medium",
+            "summary": (
+                "The capture is dominated by many TCP flows carrying very little data."
+            ),
+            "evidence": [
+                f"{low_data:,} low-data flows ({low_ratio * 100:.1f}%)",
+                f"{existing:,} flows likely existed before capture ({existing_ratio * 100:.1f}%)",
+                f"{active:,} flows show stronger application activity",
+                f"{target_flow_share:.1f}% of TCP flows target the main destination",
+            ],
+        }
+
+    # ----------------------------------------------------
+    # 4. SYN flood only when SYN behavior dominates
+    # ----------------------------------------------------
+    # SYN flood classification now requires:
+    #   - substantial SYN volume
+    #   - SYNs make up a large share of TCP packets
+    #   - very few SYN-ACK responses are visible
+    #   - little ACK / PSH / application-bearing traffic
+    #
+    # This prevents normal TCP setup during a Layer 7 attack from
+    # being mistaken for the attack vector itself.
+    syn_dominant = (
+        syns >= 100
+        and syn_ratio >= 0.50
+        and syn_acks / max(syns, 1) < 0.20
+        and ack_ratio < 0.30
+        and psh_ratio < 0.05
+        and tls_app_packets < 20
+        and http_requests < 20
+        and payload_bytes < 500_000
+    )
+
+    if syn_dominant:
+        return {
+            "name": "Possible SYN Flood",
+            "confidence": "Medium",
+            "summary": (
+                "TCP connection attempts dominate the capture and very little "
+                "traffic progresses into established or application-bearing sessions."
+            ),
+            "evidence": [
+                f"{syns:,} SYN packets ({syn_ratio * 100:.1f}% of TCP packets)",
+                f"{syn_acks:,} SYN-ACK packets",
+                f"{acks:,} ACK packets",
+                f"{psh:,} PSH packets",
+                f"{payload_bytes:,} bytes of TCP payload",
+            ],
+        }
+
+    # ----------------------------------------------------
+    # 5. Destination concentration without clear vector
+    # ----------------------------------------------------
+    if strongly_targeted:
+        return {
+            "name": "Traffic Concentrated on One Destination",
+            "confidence": "Medium",
+            "summary": (
+                "Most observed traffic is directed to one destination, but the "
+                "current evidence is not enough to classify the attack vector."
+            ),
+            "evidence": [
+                f"{target_packet_share:.1f}% of packets",
+                f"{target_flow_share:.1f}% of TCP flows",
+                f"{target_payload_share:.1f}% of TCP payload",
+            ],
+        }
+
+    return {
+        "name": "Inconclusive",
+        "confidence": "Low",
+        "summary": (
+            "The current capture does not provide enough evidence for a reliable "
+            "attack classification."
+        ),
+        "evidence": [
+            f"{total_flows:,} TCP flows",
+            f"{low_data:,} low-data flows",
+            f"{target_flow_share:.1f}% of TCP flows target the main destination",
+        ],
+    }
+
+
+
 def analyze_pcap(path):
     fh, reader, capture_format = open_capture(path)
 
@@ -170,6 +369,8 @@ def analyze_pcap(path):
     sources = defaultdict(int)
     destinations = defaultdict(int)
     dst_ports = defaultdict(int)
+    destination_tcp_packets = defaultdict(int)
+    destination_tcp_payload = defaultdict(int)
 
     first_ts = None
     last_ts = None
@@ -207,6 +408,7 @@ def analyze_pcap(path):
 
                 stats["tcp_packets"] += 1
                 dst_ports[tcp.dport] += 1
+                destination_tcp_packets[dst] += 1
 
                 syn = bool(tcp.flags & dpkt.tcp.TH_SYN)
                 ack = bool(tcp.flags & dpkt.tcp.TH_ACK)
@@ -229,6 +431,7 @@ def analyze_pcap(path):
 
                 payload = bytes(tcp.data or b"")
                 stats["tcp_payload_bytes"] += len(payload)
+                destination_tcp_payload[dst] += len(payload)
 
                 tls = tls_markers(payload)
                 http = http_markers(payload)
@@ -563,6 +766,77 @@ def analyze_pcap(path):
             ascending=False,
         )
 
+
+    destination_flow_counts = defaultdict(int)
+
+    for f in flows.values():
+        a_ip, a_port = f["Endpoint A"], f["Port A"]
+        b_ip, b_port = f["Endpoint B"], f["Port B"]
+
+        service_ports = {
+            20, 21, 22, 23, 25, 53, 80, 110, 123, 143, 389, 443, 445,
+            465, 587, 636, 993, 995, 1433, 1521, 2049, 3306, 3389,
+            5432, 6379, 8080, 8443
+        }
+
+        if a_port in service_ports and b_port not in service_ports:
+            likely_dst = a_ip
+        elif b_port in service_ports and a_port not in service_ports:
+            likely_dst = b_ip
+        else:
+            likely_dst = (
+                a_ip
+                if destinations.get(a_ip, 0) >= destinations.get(b_ip, 0)
+                else b_ip
+            )
+
+        destination_flow_counts[likely_dst] += 1
+
+    all_destination_ips = set(destinations) | set(destination_tcp_payload) | set(destination_flow_counts)
+    destination_rows = []
+
+    for ip in all_destination_ips:
+        destination_rows.append({
+            "Destination IP": ip,
+            "Packets": destinations.get(ip, 0),
+            "Packet Share %": round(destinations.get(ip, 0) / max(stats["total_packets"], 1) * 100, 2),
+            "TCP Flows": destination_flow_counts.get(ip, 0),
+            "Flow Share %": round(destination_flow_counts.get(ip, 0) / max(stats["tcp_flows"], 1) * 100, 2),
+            "TCP Payload Bytes": destination_tcp_payload.get(ip, 0),
+            "Payload Share %": round(destination_tcp_payload.get(ip, 0) / max(stats["tcp_payload_bytes"], 1) * 100, 2),
+        })
+
+    destination_concentration_df = pd.DataFrame(destination_rows)
+
+    if not destination_concentration_df.empty:
+        destination_concentration_df = destination_concentration_df.sort_values(
+            ["TCP Flows", "TCP Payload Bytes", "Packets"],
+            ascending=False,
+        )
+        top = destination_concentration_df.iloc[0]
+        target_ip = str(top["Destination IP"])
+        target_info = {
+            "ip": target_ip,
+            "domain": reverse_dns(target_ip),
+            "packet_share_pct": float(top["Packet Share %"]),
+            "flow_share_pct": float(top["Flow Share %"]),
+            "payload_share_pct": float(top["Payload Share %"]),
+            "packets": int(top["Packets"]),
+            "flows": int(top["TCP Flows"]),
+            "payload_bytes": int(top["TCP Payload Bytes"]),
+        }
+    else:
+        target_info = {
+            "ip": None,
+            "domain": None,
+            "packet_share_pct": 0.0,
+            "flow_share_pct": 0.0,
+            "payload_share_pct": 0.0,
+            "packets": 0,
+            "flows": 0,
+            "payload_bytes": 0,
+        }
+
     src_df = pd.DataFrame(
         sorted(
             sources.items(),
@@ -596,6 +870,8 @@ def analyze_pcap(path):
         src_df,
         dst_df,
         port_df,
+        destination_concentration_df,
+        target_info,
     )
 
 
@@ -613,8 +889,8 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Version 0.4")
-    st.caption("Simplified analyst view")
+    st.caption("Version 0.6")
+    st.caption("Improved attack classification")
 
 
 if page == "Analyze PCAP":
@@ -660,7 +936,17 @@ if page == "Analyze PCAP":
 
                 progress.progress(40, text="Analyzing traffic behavior...")
 
-                stats, flows, srcs, dsts, ports = analyze_pcap(tmp_path)
+                (
+                    stats,
+                    flows,
+                    srcs,
+                    dsts,
+                    ports,
+                    destination_concentration,
+                    target_info,
+                ) = analyze_pcap(tmp_path)
+
+                assessment = classify_attack(stats, target_info)
 
                 st.session_state["analysis"] = {
                     "filename": uploaded.name,
@@ -669,6 +955,9 @@ if page == "Analyze PCAP":
                     "sources": srcs,
                     "destinations": dsts,
                     "ports": ports,
+                    "destination_concentration": destination_concentration,
+                    "target_info": target_info,
+                    "attack_assessment": assessment,
                 }
 
                 progress.progress(100, text="Analysis complete")
@@ -696,6 +985,45 @@ if page == "Analyze PCAP":
             top[1].metric("Capture time", f'{s["capture_duration"]} s')
             top[2].metric("TCP flows", f'{s["tcp_flows"]:,}')
             top[3].metric("TCP payload", human_bytes(s["tcp_payload_bytes"]))
+
+            target = analysis["target_info"]
+            assessment = analysis["attack_assessment"]
+
+            st.subheader("Main Traffic Destination")
+
+            if target["ip"]:
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Destination IP", target["ip"])
+                d2.metric(
+                    "Domain",
+                    target["domain"] if target["domain"] else "No reverse DNS found",
+                )
+                d3.metric("Share of TCP flows", f'{target["flow_share_pct"]:.1f}%')
+                d4.metric("Share of TCP payload", f'{target["payload_share_pct"]:.1f}%')
+
+                if max(
+                    target["packet_share_pct"],
+                    target["flow_share_pct"],
+                    target["payload_share_pct"],
+                ) >= 50:
+                    st.caption(
+                        "This IP receives the largest share of observed traffic and is the current best candidate for the attacked destination."
+                    )
+                else:
+                    st.caption(
+                        "This is the largest destination in the capture, but traffic is not strongly concentrated on one IP."
+                    )
+            else:
+                st.warning("No clear destination IP could be identified.")
+
+            st.subheader("Attack Conclusion")
+            st.markdown(
+                f"**{assessment['name']}**  \nConfidence: **{assessment['confidence']}**"
+            )
+            st.write(assessment["summary"])
+            st.markdown("**Why:**")
+            for item in assessment["evidence"]:
+                st.write(f"• {item}")
 
             total_flows = max(s["tcp_flows"], 1)
             likely_existing = s["established_before_capture"]
@@ -749,10 +1077,6 @@ if page == "Analyze PCAP":
                     "Protocol evidence helps show whether traffic reached the application layer."
                 )
 
-            st.info(
-                "Current assessment: attack classification is not enabled yet. "
-                "This view only summarizes the observed traffic behavior."
-            )
 
             with st.expander("Detailed TCP statistics"):
                 cols = st.columns(4)
@@ -832,6 +1156,17 @@ if page == "Analyze PCAP":
                         "text/csv",
                     )
 
+            with st.expander("Destination concentration"):
+                dc = analysis["destination_concentration"]
+                if dc.empty:
+                    st.info("No destination concentration data available.")
+                else:
+                    st.dataframe(
+                        dc.head(20),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
             with st.expander("Source and destination details"):
                 tabs = st.tabs(
                     ["Sources", "Destinations", "Destination Ports"]
@@ -858,12 +1193,29 @@ if page == "Analyze PCAP":
                         hide_index=True,
                     )
 
+            st.subheader("Terms Used")
+            st.markdown(
+                """
+                **TCP flow:** Packets that belong to the same TCP conversation, identified by the two IP addresses and two TCP ports.
+
+                **Likely existing before capture:** The handshake was not captured, but later packet behavior suggests the connection was already active.
+
+                **Low-data flow:** A likely active TCP flow carrying 1 KB or less of TCP payload during this capture.
+
+                **Active application flow:** A flow with stronger evidence of application communication, such as TLS application data, visible HTTP, or payload in both directions.
+
+                **ClientHello:** The first TLS handshake message normally sent by a client when starting a TLS session.
+
+                **Main traffic destination:** The destination IP receiving the largest share of observed traffic. It is the best target candidate, not automatic proof by itself.
+                """
+            )
+
 elif page == "Detection Logic":
     st.title("Detection Logic")
 
     st.write(
         "The attack classifier is not enabled yet. "
-        "Version 0.4 focuses on reliable feature extraction."
+        "Version 0.6 focuses on reliable feature extraction."
     )
 
     df = pd.DataFrame(

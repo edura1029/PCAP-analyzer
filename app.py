@@ -194,11 +194,14 @@ def classify_attack(stats, target):
         )
     )
 
-    strongly_targeted = max(
-        target_packet_share,
-        target_flow_share,
-        target_payload_share,
-    ) >= 70
+    strongly_targeted = (
+        target.get("scoped", False)
+        or max(
+            target_packet_share,
+            target_flow_share,
+            target_payload_share,
+        ) >= 70
+    )
 
     if strong_application_evidence and strongly_targeted:
         evidence = [
@@ -334,7 +337,7 @@ def classify_attack(stats, target):
 
 
 
-def analyze_pcap(path):
+def analyze_pcap(path, ip_filter=None):
     fh, reader, capture_format = open_capture(path)
 
     stats = defaultdict(
@@ -374,16 +377,10 @@ def analyze_pcap(path):
 
     first_ts = None
     last_ts = None
+    matching_ip_packets = 0
 
     try:
         for ts, raw in reader:
-            stats["total_packets"] += 1
-            stats["total_bytes"] += len(raw)
-
-            if first_ts is None:
-                first_ts = ts
-            last_ts = ts
-
             try:
                 eth = dpkt.ethernet.Ethernet(raw)
                 ip = eth.data
@@ -399,6 +396,21 @@ def analyze_pcap(path):
 
             src = inet_to_str(ip.src)
             dst = inet_to_str(ip.dst)
+
+            # Optional scoped analysis:
+            # only analyze packets where the selected IP is either
+            # the source or destination.
+            if ip_filter:
+                if src != ip_filter and dst != ip_filter:
+                    continue
+                matching_ip_packets += 1
+
+            stats["total_packets"] += 1
+            stats["total_bytes"] += len(raw)
+
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
 
             sources[src] += 1
             destinations[dst] += 1
@@ -534,6 +546,11 @@ def analyze_pcap(path):
 
     finally:
         fh.close()
+
+    if ip_filter and matching_ip_packets == 0:
+        raise ValueError(
+            f"The IP address {ip_filter} was not found in this packet capture."
+        )
 
     capture_duration = (
         last_ts - first_ts
@@ -813,7 +830,33 @@ def analyze_pcap(path):
             ["TCP Flows", "TCP Payload Bytes", "Packets"],
             ascending=False,
         )
-        top = destination_concentration_df.iloc[0]
+
+        # During scoped analysis, the user-selected IP is the target being
+        # investigated even if responses from that IP are also present.
+        if ip_filter:
+            selected = destination_concentration_df[
+                destination_concentration_df["Destination IP"] == ip_filter
+            ]
+            if not selected.empty:
+                top = selected.iloc[0]
+            else:
+                # The IP exists in the capture but may only appear as a source.
+                top = pd.Series({
+                    "Destination IP": ip_filter,
+                    "Packets": 0,
+                    "Packet Share %": 0.0,
+                    "TCP Flows": sum(
+                        1
+                        for f in flows.values()
+                        if f["Endpoint A"] == ip_filter or f["Endpoint B"] == ip_filter
+                    ),
+                    "Flow Share %": 100.0 if stats["tcp_flows"] else 0.0,
+                    "TCP Payload Bytes": 0,
+                    "Payload Share %": 0.0,
+                })
+        else:
+            top = destination_concentration_df.iloc[0]
+
         target_ip = str(top["Destination IP"])
         target_info = {
             "ip": target_ip,
@@ -824,6 +867,7 @@ def analyze_pcap(path):
             "packets": int(top["Packets"]),
             "flows": int(top["TCP Flows"]),
             "payload_bytes": int(top["TCP Payload Bytes"]),
+            "scoped": bool(ip_filter),
         }
     else:
         target_info = {
@@ -835,6 +879,7 @@ def analyze_pcap(path):
             "packets": 0,
             "flows": 0,
             "payload_bytes": 0,
+            "scoped": bool(ip_filter),
         }
 
     src_df = pd.DataFrame(
@@ -875,6 +920,201 @@ def analyze_pcap(path):
     )
 
 
+def safe_rate(value, duration):
+    return (value / duration) if duration and duration > 0 else 0.0
+
+
+def ratio_change(attack_value, peace_value):
+    if peace_value == 0:
+        return None if attack_value == 0 else float("inf")
+    return attack_value / peace_value
+
+
+def fmt_change(value):
+    if value is None:
+        return "n/a"
+    if value == float("inf"):
+        return "new / no peace-time baseline"
+    return f"{value:.2f}x"
+
+
+def comparison_metrics(stats):
+    """Build normalized rate and behavioral-composition metrics."""
+    duration = stats.get("capture_duration", 0)
+    tcp_packets = max(stats.get("tcp_packets", 0), 1)
+    flows = max(stats.get("tcp_flows", 0), 1)
+
+    return {
+        "Packets/sec": safe_rate(stats.get("total_packets", 0), duration),
+        "TCP flows/sec": safe_rate(stats.get("tcp_flows", 0), duration),
+        "SYN/sec": safe_rate(stats.get("syn_packets", 0), duration),
+        "TCP payload bytes/sec": safe_rate(stats.get("tcp_payload_bytes", 0), duration),
+        "TLS App Data/sec": safe_rate(stats.get("tls_application_data_packets", 0), duration),
+        "ClientHello/sec": safe_rate(stats.get("client_hellos", 0), duration),
+        "HTTP requests/sec": safe_rate(stats.get("http_requests", 0), duration),
+        "SYN % of TCP": stats.get("syn_packets", 0) / tcp_packets * 100,
+        "ACK % of TCP": stats.get("ack_packets", 0) / tcp_packets * 100,
+        "PSH % of TCP": stats.get("psh_packets", 0) / tcp_packets * 100,
+        "Low-data % of flows": stats.get("low_data_flows", 0) / flows * 100,
+        "Active app % of flows": stats.get("active_application_flows", 0) / flows * 100,
+        "Payload bytes/flow": stats.get("tcp_payload_bytes", 0) / flows,
+    }
+
+
+def compare_attack_to_peace(peace_stats, attack_stats, attack_target):
+    """
+    Baseline-aware assessment.
+    Rate changes measure intensity; composition changes measure behavior.
+    """
+    p = comparison_metrics(peace_stats)
+    a = comparison_metrics(attack_stats)
+
+    pps_x = ratio_change(a["Packets/sec"], p["Packets/sec"])
+    flow_x = ratio_change(a["TCP flows/sec"], p["TCP flows/sec"])
+    syn_x = ratio_change(a["SYN/sec"], p["SYN/sec"])
+    payload_x = ratio_change(a["TCP payload bytes/sec"], p["TCP payload bytes/sec"])
+    tls_x = ratio_change(a["TLS App Data/sec"], p["TLS App Data/sec"])
+    http_x = ratio_change(a["HTTP requests/sec"], p["HTTP requests/sec"])
+
+    app_rate_candidates = [x for x in (payload_x, tls_x, http_x) if x not in (None,)]
+    finite_app = [x for x in app_rate_candidates if x != float("inf")]
+    app_growth = max(finite_app) if finite_app else (float("inf") if float("inf") in app_rate_candidates else 0)
+
+    syn_pct_delta = a["SYN % of TCP"] - p["SYN % of TCP"]
+    app_pct_delta = a["Active app % of flows"] - p["Active app % of flows"]
+    low_pct_delta = a["Low-data % of flows"] - p["Low-data % of flows"]
+
+    # Prefer application-layer change when application-bearing traffic grows
+    # much more strongly than SYN behavior.
+    app_dominant = (
+        (app_growth == float("inf") or app_growth >= 3.0)
+        and (
+            syn_x in (None,)
+            or syn_x == float("inf") and a["SYN % of TCP"] < 20
+            or (syn_x != float("inf") and app_growth >= max(syn_x * 2, 3.0))
+            or app_pct_delta >= 15
+        )
+    )
+
+    syn_dominant = (
+        (syn_x == float("inf") or (syn_x is not None and syn_x >= 3.0))
+        and a["SYN % of TCP"] >= max(30.0, p["SYN % of TCP"] + 15.0)
+        and a["Active app % of flows"] <= max(15.0, p["Active app % of flows"])
+    )
+
+    low_data_dominant = (
+        low_pct_delta >= 20
+        and a["Low-data % of flows"] >= 70
+        and a["Active app % of flows"] < 30
+    )
+
+    if app_dominant:
+        return {
+            "name": "Possible Web / Layer 7 DDoS",
+            "confidence": "High" if app_growth == float("inf") or app_growth >= 10 else "Medium",
+            "summary": (
+                "Compared with peace time, the attack capture shows a disproportionate "
+                "increase in application-bearing traffic. The change is stronger than "
+                "the observed TCP connection-setup change."
+            ),
+            "evidence": [
+                f"Packet rate change: {fmt_change(pps_x)}",
+                f"TCP flow rate change: {fmt_change(flow_x)}",
+                f"TCP payload rate change: {fmt_change(payload_x)}",
+                f"TLS Application Data rate change: {fmt_change(tls_x)}",
+                f"HTTP request rate change: {fmt_change(http_x)}",
+                f"SYN rate change: {fmt_change(syn_x)}",
+            ],
+        }
+
+    if syn_dominant:
+        return {
+            "name": "Possible SYN / Connection Establishment Flood",
+            "confidence": "Medium",
+            "summary": (
+                "Compared with peace time, SYN activity increased sharply and became "
+                "a much larger part of TCP traffic, without a comparable increase in "
+                "application-active flows."
+            ),
+            "evidence": [
+                f"SYN rate change: {fmt_change(syn_x)}",
+                f"SYN share: {p['SYN % of TCP']:.1f}% → {a['SYN % of TCP']:.1f}%",
+                f"Active application flows: {p['Active app % of flows']:.1f}% → {a['Active app % of flows']:.1f}%",
+                f"Packet rate change: {fmt_change(pps_x)}",
+            ],
+        }
+
+    if low_data_dominant:
+        return {
+            "name": "Possible Low-Data Connection Flood",
+            "confidence": "Medium",
+            "summary": (
+                "The attack capture contains a substantially larger proportion of "
+                "low-data TCP flows than the peace-time baseline."
+            ),
+            "evidence": [
+                f"Low-data flows: {p['Low-data % of flows']:.1f}% → {a['Low-data % of flows']:.1f}%",
+                f"Active application flows: {p['Active app % of flows']:.1f}% → {a['Active app % of flows']:.1f}%",
+                f"TCP flow rate change: {fmt_change(flow_x)}",
+            ],
+        }
+
+    # Fall back to the single-capture classifier but make the baseline limitation clear.
+    base = classify_attack(attack_stats, attack_target)
+    if base["name"] == "Possible Web / Layer 7 DDoS":
+        base["confidence"] = "Medium"
+        base["summary"] = (
+            "The attack capture contains application-bearing traffic, but the change "
+            "from peace time is not strong enough for the baseline comparison alone "
+            "to clearly separate the attack vector."
+        )
+    return base
+
+
+def comparison_dataframe(peace_stats, attack_stats):
+    p = comparison_metrics(peace_stats)
+    a = comparison_metrics(attack_stats)
+
+    rows = []
+    rate_names = [
+        "Packets/sec",
+        "TCP flows/sec",
+        "SYN/sec",
+        "TCP payload bytes/sec",
+        "TLS App Data/sec",
+        "ClientHello/sec",
+        "HTTP requests/sec",
+    ]
+    behavior_names = [
+        "SYN % of TCP",
+        "ACK % of TCP",
+        "PSH % of TCP",
+        "Low-data % of flows",
+        "Active app % of flows",
+        "Payload bytes/flow",
+    ]
+
+    for name in rate_names:
+        rows.append({
+            "Metric": name,
+            "Peace Time": round(p[name], 2),
+            "Attack": round(a[name], 2),
+            "Change": fmt_change(ratio_change(a[name], p[name])),
+            "Comparison": "Rate",
+        })
+
+    for name in behavior_names:
+        rows.append({
+            "Metric": name,
+            "Peace Time": round(p[name], 2),
+            "Attack": round(a[name], 2),
+            "Change": f"{a[name] - p[name]:+.2f}",
+            "Comparison": "Behavior",
+        })
+
+    return pd.DataFrame(rows)
+
+
 with st.sidebar:
     st.title("🛡️ PCAP Analyzer")
     st.caption("Internal attack traffic analysis")
@@ -889,74 +1129,169 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Version 0.6")
-    st.caption("Improved attack classification")
+    st.caption("Version 0.8")
+    st.caption("Peace-time vs attack comparison")
 
 
 if page == "Analyze PCAP":
     st.title("PCAP Attack Traffic Analyzer")
 
     st.write(
-        "Upload a PCAP or PCAPNG capture. The tool summarizes the important "
-        "traffic behavior first, while keeping technical details available "
-        "for deeper investigation."
+        "Analyze one attack capture, or compare peace-time traffic with attack "
+        "traffic. Comparison mode normalizes traffic by capture duration so PCAPs "
+        "do not need to contain the same number of packets."
     )
 
-    uploaded = st.file_uploader(
-        "Upload packet capture",
-        type=["pcap", "pcapng", "cap"],
+    analysis_type = st.radio(
+        "Analysis mode",
+        ["Compare Peace Time vs Attack", "Attack PCAP only"],
+        horizontal=True,
     )
 
-    if uploaded is None:
-        st.info("Upload a packet capture to begin.")
-
+    if analysis_type == "Compare Peace Time vs Attack":
+        u1, u2 = st.columns(2)
+        with u1:
+            peace_uploaded = st.file_uploader(
+                "Peace Time PCAP",
+                type=["pcap", "pcapng", "cap"],
+                key="peace_upload",
+            )
+        with u2:
+            attack_uploaded = st.file_uploader(
+                "Attack PCAP",
+                type=["pcap", "pcapng", "cap"],
+                key="attack_upload",
+            )
+        uploaded = attack_uploaded
     else:
-        data = uploaded.getvalue()
+        peace_uploaded = None
+        uploaded = st.file_uploader(
+            "Attack PCAP",
+            type=["pcap", "pcapng", "cap"],
+            key="single_upload",
+        )
 
-        a, b = st.columns([3, 1])
-        a.success(f"Loaded: {uploaded.name}")
-        b.metric("File size", human_bytes(len(data)))
+    analysis_scope = st.radio(
+        "Traffic scope",
+        ["Entire PCAP", "Specific IP address"],
+        horizontal=True,
+        help=(
+            "Specific IP address filters both captures first, then performs the "
+            "comparison only on traffic where that IP is source or destination."
+        ),
+    )
 
-        if st.button(
-            "Analyze Traffic",
-            type="primary",
-            use_container_width=True,
-        ):
-            progress = st.progress(10, text="Preparing capture...")
-            suffix = Path(uploaded.name).suffix or ".pcap"
-            tmp_path = None
+    selected_ip = None
+    if analysis_scope == "Specific IP address":
+        selected_ip = st.text_input(
+            "IP address to analyze",
+            placeholder="Example: 162.214.80.88",
+        ).strip()
+
+    ready = uploaded is not None and (
+        analysis_type == "Attack PCAP only" or peace_uploaded is not None
+    )
+
+    if not ready:
+        if analysis_type == "Compare Peace Time vs Attack":
+            st.info("Upload both the peace-time and attack captures to begin.")
+        else:
+            st.info("Upload an attack capture to begin.")
+    else:
+        if analysis_type == "Compare Peace Time vs Attack":
+            c1, c2 = st.columns(2)
+            c1.success(f"Peace time: {peace_uploaded.name}")
+            c2.success(f"Attack: {uploaded.name}")
+            c1.metric("Peace file size", human_bytes(len(peace_uploaded.getvalue())))
+            c2.metric("Attack file size", human_bytes(len(uploaded.getvalue())))
+        else:
+            a, b = st.columns([3, 1])
+            a.success(f"Loaded: {uploaded.name}")
+            b.metric("File size", human_bytes(len(uploaded.getvalue())))
+
+        if st.button("Analyze Traffic", type="primary", use_container_width=True):
+            if analysis_scope == "Specific IP address" and not selected_ip:
+                st.error("Enter an IP address before starting the analysis.")
+                st.stop()
+
+            if selected_ip:
+                try:
+                    socket.inet_pton(
+                        socket.AF_INET6 if ":" in selected_ip else socket.AF_INET,
+                        selected_ip,
+                    )
+                except OSError:
+                    st.error("Enter a valid IPv4 or IPv6 address.")
+                    st.stop()
+
+            progress = st.progress(10, text="Preparing captures...")
+            temp_paths = []
 
             try:
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=suffix,
-                ) as tmp:
-                    tmp.write(data)
-                    tmp_path = tmp.name
+                def save_upload(upload):
+                    suffix = Path(upload.name).suffix or ".pcap"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(upload.getvalue())
+                        temp_paths.append(tmp.name)
+                        return tmp.name
 
-                progress.progress(40, text="Analyzing traffic behavior...")
+                attack_path = save_upload(uploaded)
+                peace_path = save_upload(peace_uploaded) if peace_uploaded else None
 
+                progress.progress(35, text="Analyzing attack traffic...")
+                attack_result = analyze_pcap(attack_path, selected_ip)
                 (
-                    stats,
-                    flows,
-                    srcs,
-                    dsts,
-                    ports,
-                    destination_concentration,
-                    target_info,
-                ) = analyze_pcap(tmp_path)
+                    attack_stats,
+                    attack_flows,
+                    attack_srcs,
+                    attack_dsts,
+                    attack_ports,
+                    attack_dc,
+                    attack_target,
+                ) = attack_result
 
-                assessment = classify_attack(stats, target_info)
+                peace_result = None
+                comparison = None
+
+                if peace_path:
+                    progress.progress(60, text="Analyzing peace-time baseline...")
+                    peace_result = analyze_pcap(peace_path, selected_ip)
+                    peace_stats = peace_result[0]
+                    comparison = comparison_dataframe(peace_stats, attack_stats)
+                    assessment = compare_attack_to_peace(
+                        peace_stats, attack_stats, attack_target
+                    )
+                else:
+                    assessment = classify_attack(attack_stats, attack_target)
 
                 st.session_state["analysis"] = {
-                    "filename": uploaded.name,
-                    "stats": stats,
-                    "flows": flows,
-                    "sources": srcs,
-                    "destinations": dsts,
-                    "ports": ports,
-                    "destination_concentration": destination_concentration,
-                    "target_info": target_info,
+                    "analysis_type": analysis_type,
+                    "analysis_scope": analysis_scope,
+                    "selected_ip": selected_ip,
+                    "attack_filename": uploaded.name,
+                    "peace_filename": peace_uploaded.name if peace_uploaded else None,
+                    "attack": {
+                        "stats": attack_stats,
+                        "flows": attack_flows,
+                        "sources": attack_srcs,
+                        "destinations": attack_dsts,
+                        "ports": attack_ports,
+                        "destination_concentration": attack_dc,
+                        "target_info": attack_target,
+                    },
+                    "peace": (
+                        {
+                            "stats": peace_result[0],
+                            "flows": peace_result[1],
+                            "sources": peace_result[2],
+                            "destinations": peace_result[3],
+                            "ports": peace_result[4],
+                            "destination_concentration": peace_result[5],
+                            "target_info": peace_result[6],
+                        }
+                        if peace_result else None
+                    ),
+                    "comparison": comparison,
                     "attack_assessment": assessment,
                 }
 
@@ -966,57 +1301,36 @@ if page == "Analyze PCAP":
             except Exception as exc:
                 progress.empty()
                 st.error(f"Analysis failed: {exc}")
-
             finally:
-                if tmp_path:
-                    Path(tmp_path).unlink(missing_ok=True)
+                for p in temp_paths:
+                    Path(p).unlink(missing_ok=True)
 
         analysis = st.session_state.get("analysis")
+        valid = (
+            analysis
+            and analysis.get("analysis_type") == analysis_type
+            and analysis.get("analysis_scope") == analysis_scope
+            and analysis.get("selected_ip") == selected_ip
+            and analysis.get("attack_filename") == uploaded.name
+            and analysis.get("peace_filename")
+                == (peace_uploaded.name if peace_uploaded else None)
+        )
 
-        if analysis and analysis["filename"] == uploaded.name:
-            s = analysis["stats"]
-            flows = analysis["flows"]
-
-            st.divider()
-            st.subheader("Traffic Overview")
-
-            top = st.columns(4)
-            top[0].metric("Packets", f'{s["total_packets"]:,}')
-            top[1].metric("Capture time", f'{s["capture_duration"]} s')
-            top[2].metric("TCP flows", f'{s["tcp_flows"]:,}')
-            top[3].metric("TCP payload", human_bytes(s["tcp_payload_bytes"]))
-
-            target = analysis["target_info"]
+        if valid:
+            attack = analysis["attack"]
+            s = attack["stats"]
+            target = attack["target_info"]
             assessment = analysis["attack_assessment"]
 
-            st.subheader("Main Traffic Destination")
+            st.divider()
 
-            if target["ip"]:
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Destination IP", target["ip"])
-                d2.metric(
-                    "Domain",
-                    target["domain"] if target["domain"] else "No reverse DNS found",
+            if selected_ip:
+                st.info(
+                    f"Scoped analysis: both captures are filtered to traffic involving "
+                    f"{selected_ip} before comparison."
                 )
-                d3.metric("Share of TCP flows", f'{target["flow_share_pct"]:.1f}%')
-                d4.metric("Share of TCP payload", f'{target["payload_share_pct"]:.1f}%')
 
-                if max(
-                    target["packet_share_pct"],
-                    target["flow_share_pct"],
-                    target["payload_share_pct"],
-                ) >= 50:
-                    st.caption(
-                        "This IP receives the largest share of observed traffic and is the current best candidate for the attacked destination."
-                    )
-                else:
-                    st.caption(
-                        "This is the largest destination in the capture, but traffic is not strongly concentrated on one IP."
-                    )
-            else:
-                st.warning("No clear destination IP could be identified.")
-
-            st.subheader("Attack Conclusion")
+            st.subheader("Attack Assessment")
             st.markdown(
                 f"**{assessment['name']}**  \nConfidence: **{assessment['confidence']}**"
             )
@@ -1025,188 +1339,132 @@ if page == "Analyze PCAP":
             for item in assessment["evidence"]:
                 st.write(f"• {item}")
 
-            total_flows = max(s["tcp_flows"], 1)
-            likely_existing = s["established_before_capture"]
-            low_data = s["low_data_flows"]
-            active_app = s["active_application_flows"]
-            existing_pct = round((likely_existing / total_flows) * 100, 1)
-            low_data_pct = round((low_data / total_flows) * 100, 1)
+            if analysis["peace"] is not None:
+                ps = analysis["peace"]["stats"]
+                st.subheader("Peace Time vs Attack")
 
-            st.subheader("What the capture shows")
-
-            c1, c2, c3 = st.columns(3)
-
-            with c1:
-                st.markdown("**Connections**")
-                st.metric(
-                    "Likely existing before capture",
-                    f"{likely_existing:,}",
-                    f"{existing_pct}% of TCP flows",
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric(
+                    "Packets/sec",
+                    f'{safe_rate(s["total_packets"], s["capture_duration"]):,.2f}',
+                    fmt_change(ratio_change(
+                        safe_rate(s["total_packets"], s["capture_duration"]),
+                        safe_rate(ps["total_packets"], ps["capture_duration"]),
+                    )),
                 )
-                st.metric(
-                    "New connection attempts seen",
-                    f'{s["syn_packets"]:,}',
+                c2.metric(
+                    "TCP flows/sec",
+                    f'{safe_rate(s["tcp_flows"], s["capture_duration"]):,.2f}',
+                    fmt_change(ratio_change(
+                        safe_rate(s["tcp_flows"], s["capture_duration"]),
+                        safe_rate(ps["tcp_flows"], ps["capture_duration"]),
+                    )),
                 )
+                c3.metric(
+                    "TCP payload/sec",
+                    human_bytes(safe_rate(s["tcp_payload_bytes"], s["capture_duration"])),
+                    fmt_change(ratio_change(
+                        safe_rate(s["tcp_payload_bytes"], s["capture_duration"]),
+                        safe_rate(ps["tcp_payload_bytes"], ps["capture_duration"]),
+                    )),
+                )
+                c4.metric(
+                    "TLS App Data/sec",
+                    f'{safe_rate(s["tls_application_data_packets"], s["capture_duration"]):,.2f}',
+                    fmt_change(ratio_change(
+                        safe_rate(s["tls_application_data_packets"], s["capture_duration"]),
+                        safe_rate(ps["tls_application_data_packets"], ps["capture_duration"]),
+                    )),
+                )
+
                 st.caption(
-                    "Most flows look like they were already active when the capture started."
+                    "The main comparison uses rates per second and behavioral ratios. "
+                    "This keeps the comparison fair even when the two PCAPs have "
+                    "different durations or packet counts."
                 )
 
-            with c2:
-                st.markdown("**Data**")
-                st.metric(
-                    "Low-data flows",
-                    f"{low_data:,}",
-                    f"{low_data_pct}% of TCP flows",
-                )
-                st.metric(
-                    "Flows with stronger app activity",
-                    f"{active_app:,}",
-                )
-                st.caption(
-                    "Most flows carry only a small amount of payload."
-                )
+                with st.expander("Full peace-time vs attack comparison", expanded=True):
+                    st.dataframe(
+                        analysis["comparison"],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-            with c3:
-                st.markdown("**Protocols**")
-                st.metric("TLS ClientHello", f'{s["client_hellos"]:,}')
-                st.metric(
-                    "TLS Application Data",
-                    f'{s["tls_application_data_packets"]:,}',
-                )
-                st.caption(
-                    "Protocol evidence helps show whether traffic reached the application layer."
-                )
+            st.subheader("Attack Capture Overview")
+            top = st.columns(4)
+            top[0].metric("Packets", f'{s["total_packets"]:,}')
+            top[1].metric("Capture time", f'{s["capture_duration"]} s')
+            top[2].metric("TCP flows", f'{s["tcp_flows"]:,}')
+            top[3].metric("TCP payload", human_bytes(s["tcp_payload_bytes"]))
 
+            st.subheader(
+                "Selected IP Analysis" if selected_ip else "Main Traffic Destination"
+            )
+            if target["ip"]:
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Destination IP", target["ip"])
+                d2.metric("Domain", target["domain"] or "No reverse DNS found")
+                d3.metric("TCP connections targeting this IP", f'{target["flow_share_pct"]:.1f}%')
+                d4.metric("TCP data targeting this IP", f'{target["payload_share_pct"]:.1f}%')
 
-            with st.expander("Detailed TCP statistics"):
+            with st.expander("Detailed attack TCP / TLS statistics"):
                 cols = st.columns(4)
                 cols[0].metric("SYN", f'{s["syn_packets"]:,}')
-                cols[1].metric("SYN-ACK", f'{s["syn_ack_packets"]:,}')
-                cols[2].metric(
-                    "Completed handshakes",
-                    f'{s["completed_tcp_handshakes"]:,}',
-                )
-                cols[3].metric(
-                    "Inconclusive flows",
-                    f'{s["inconclusive_flows"]:,}',
-                )
+                cols[1].metric("ACK", f'{s["ack_packets"]:,}')
+                cols[2].metric("PSH", f'{s["psh_packets"]:,}')
+                cols[3].metric("Unknown TCP flows", f'{s["inconclusive_flows"]:,}')
 
                 cols = st.columns(4)
-                cols[0].metric(
-                    "Likely existing flows",
-                    f'{s["established_before_capture"]:,}',
-                )
-                cols[1].metric(
-                    "Established with payload",
-                    f'{s["established_with_payload"]:,}',
-                )
-                cols[2].metric(
-                    "Active application flows",
-                    f'{s["active_application_flows"]:,}',
-                )
-                cols[3].metric(
-                    "Low-data flows",
-                    f'{s["low_data_flows"]:,}',
-                )
+                cols[0].metric("Low-data flows", f'{s["low_data_flows"]:,}')
+                cols[1].metric("Active app flows", f'{s["active_application_flows"]:,}')
+                cols[2].metric("TLS ClientHello", f'{s["client_hellos"]:,}')
+                cols[3].metric("TLS App Data", f'{s["tls_application_data_packets"]:,}')
 
-            with st.expander("Detailed TLS / HTTP statistics"):
-                cols = st.columns(5)
-                cols[0].metric("TLS records", f'{s["tls_records"]:,}')
-                cols[1].metric("ClientHello", f'{s["client_hellos"]:,}')
-                cols[2].metric("ServerHello", f'{s["server_hellos"]:,}')
-                cols[3].metric(
-                    "TLS App Data",
-                    f'{s["tls_application_data_packets"]:,}',
-                )
-                cols[4].metric(
-                    "HTTP requests",
-                    f'{s["http_requests"]:,}',
-                )
-
-            with st.expander("TCP flow table"):
+            with st.expander("Attack TCP flow table"):
+                flows = attack["flows"]
                 if flows.empty:
                     st.info("No TCP flows found.")
                 else:
                     preferred = [
-                        "Endpoint A",
-                        "Port A",
-                        "Endpoint B",
-                        "Port B",
-                        "Packets",
-                        "Payload Bytes",
-                        "Duration (s)",
-                        "TCP State",
-                        "Payload State",
-                        "Application State",
+                        "Endpoint A", "Port A", "Endpoint B", "Port B",
+                        "Packets", "Payload Bytes", "Duration (s)",
+                        "TCP State", "Payload State", "Application State",
                     ]
-                    simple_flows = flows[
-                        [c for c in preferred if c in flows.columns]
-                    ]
-
                     st.dataframe(
-                        simple_flows,
+                        flows[[c for c in preferred if c in flows.columns]],
                         use_container_width=True,
                         hide_index=True,
                     )
-
                     st.download_button(
-                        "Download full flow analysis as CSV",
+                        "Download full attack flow analysis as CSV",
                         flows.to_csv(index=False).encode(),
-                        "tcp_flow_analysis.csv",
+                        "attack_tcp_flow_analysis.csv",
                         "text/csv",
                     )
 
-            with st.expander("Destination concentration"):
-                dc = analysis["destination_concentration"]
+            with st.expander("Attack destination concentration"):
+                dc = attack["destination_concentration"]
                 if dc.empty:
                     st.info("No destination concentration data available.")
                 else:
-                    st.dataframe(
-                        dc.head(20),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-            with st.expander("Source and destination details"):
-                tabs = st.tabs(
-                    ["Sources", "Destinations", "Destination Ports"]
-                )
-
-                with tabs[0]:
-                    st.dataframe(
-                        analysis["sources"].head(100),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                with tabs[1]:
-                    st.dataframe(
-                        analysis["destinations"].head(100),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                with tabs[2]:
-                    st.dataframe(
-                        analysis["ports"].head(100),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    st.dataframe(dc.head(20), use_container_width=True, hide_index=True)
 
             st.subheader("Terms Used")
             st.markdown(
                 """
-                **TCP flow:** Packets that belong to the same TCP conversation, identified by the two IP addresses and two TCP ports.
+                **Peace time:** A capture representing normal traffic for the same application or target.
 
-                **Likely existing before capture:** The handshake was not captured, but later packet behavior suggests the connection was already active.
+                **Rate comparison:** Traffic normalized per second, so different PCAP sizes and durations can be compared.
 
-                **Low-data flow:** A likely active TCP flow carrying 1 KB or less of TCP payload during this capture.
+                **Behavior comparison:** Ratios such as SYN percentage, low-data flow percentage, and active application flow percentage.
 
-                **Active application flow:** A flow with stronger evidence of application communication, such as TLS application data, visible HTTP, or payload in both directions.
+                **TCP flow:** Packets belonging to the same TCP conversation, identified by the two IP addresses and TCP ports.
 
-                **ClientHello:** The first TLS handshake message normally sent by a client when starting a TLS session.
+                **Low-data flow:** A likely active TCP flow carrying 1 KB or less of TCP payload during the capture.
 
-                **Main traffic destination:** The destination IP receiving the largest share of observed traffic. It is the best target candidate, not automatic proof by itself.
+                **Active application flow:** A flow with stronger evidence of application communication, such as TLS Application Data, visible HTTP, or payload in both directions.
+
+                **Unknown TCP flow:** Not enough packets were captured to determine the connection state.
                 """
             )
 
@@ -1214,8 +1472,8 @@ elif page == "Detection Logic":
     st.title("Detection Logic")
 
     st.write(
-        "The attack classifier is not enabled yet. "
-        "Version 0.6 focuses on reliable feature extraction."
+        "Version 0.8 can compare a peace-time baseline with attack traffic. "
+        "It uses normalized rates and behavioral ratios so captures do not need to be the same size."
     )
 
     df = pd.DataFrame(
@@ -1269,8 +1527,8 @@ else:
 
     st.markdown(
         "**Current:** "
-        "`PCAP → Parsing → TCP flows → TCP state inference → "
-        "Payload analysis → TLS / HTTP evidence`"
+        "`Peace PCAP + Attack PCAP → Parsing → Optional IP filtering → "
+        "Normalized rates → Behavioral comparison → Attack assessment`"
     )
 
     st.markdown(

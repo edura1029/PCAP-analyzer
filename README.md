@@ -63,3 +63,31 @@ still available inside expandable sections.
 - SYN Flood now requires SYN-dominant traffic with little ACK, PSH, TLS application data, HTTP activity, and TCP payload.
 - Added Possible Web / Layer 7 DDoS classification when substantial application-bearing traffic is concentrated on one destination.
 - This change addresses the false SYN Flood classification observed in the known Web DDoS test capture.
+
+
+## Version 0.7
+
+Added scoped IP analysis.
+
+You can now choose:
+
+- **Entire PCAP**: analyze the complete capture.
+- **Specific IP address**: enter one IPv4 or IPv6 address and analyze only packets where that IP is the source or destination.
+
+The same TCP flow, payload, TLS/HTTP, destination, and attack-classification logic is then applied only to that selected traffic.
+
+
+## Version 0.8
+
+Added peace-time baseline comparison.
+
+### New analysis modes
+- Compare Peace Time vs Attack
+- Attack PCAP only
+
+### Comparison method
+PCAPs do not need to have the same packet count or duration. The tool compares normalized rates such as packets/sec, TCP flows/sec, SYN/sec, TCP payload bytes/sec, TLS Application Data/sec, ClientHello/sec, and HTTP requests/sec.
+
+It also compares behavioral composition such as SYN/ACK/PSH percentage, low-data flow percentage, active application flow percentage, and payload bytes per flow.
+
+If a specific IP is selected, both captures are filtered to that IP before the comparison.

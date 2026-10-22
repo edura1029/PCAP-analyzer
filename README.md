@@ -1,93 +1,64 @@
-# PCAP Attack Analyzer v0.3
+# PCAP Attack Analyzer v0.8
 
-This version improves TCP flow analysis for captures that begin after
-connections were already established.
+A local Streamlit tool for investigating packet captures and comparing suspected attack traffic with a peace-time baseline.
 
-## Main changes
+## Features
 
-- Renamed TCP connections to TCP flows.
-- Infers ESTABLISHED_BEFORE_CAPTURE when the SYN handshake is missing but
-  packet behavior indicates an already active session.
-- Tracks packets and payload independently in both directions.
-- Detects PSH and ACK evidence.
-- Detects TLS Application Data in addition to ClientHello and ServerHello.
-- Detects visible plaintext HTTP requests and responses.
-- Adds TCP State, Payload State, and Application State to every TCP flow.
-- Keeps Low Data as an analytical flag only, not an attack verdict.
+- **Peace Time vs Attack:** upload two PCAP/PCAPNG captures and compare their behavior.
+- **Attack PCAP only:** analyze a capture without a baseline.
+- **Optional target IP:** include only packets where the specified IP is the source or destination in each capture.
+- **Traffic analysis:** TCP flows, TCP flags, payload, low-data flows, TLS record indicators, visible plaintext HTTP, and destination concentration.
+- **Attack assessment:** rule-based preliminary classification with supporting evidence. Baseline comparison uses rate changes and behavioral ratios.
+- **Technical details:** expandable tables and downloadable attack flow CSV.
 
-## Important
+## Requirements
 
-The tool still does not classify traffic as legitimate or malicious.
-It reports protocol evidence that will later feed the attack classifier.
+- Python 3.10 or newer (recommended)
+- Packages in `requirements.txt`: Streamlit, pandas, dpkt
 
-## Run
+## Installation
 
-Install dependencies:
+Extract the ZIP and open a terminal in the extracted directory.
 
 ```bash
 python -m pip install -r requirements.txt
-```
-
-Start the application:
-
-```bash
 python -m streamlit run app.py
 ```
 
+On some Windows systems use `py` instead of `python`.
 
-## v0.4 UI update
+## How to use
 
-The main screen now shows only the most important analyst information:
+1. Select **Compare Peace Time vs Attack** or **Attack PCAP only**.
+2. Upload the requested capture files (`.pcap`, `.pcapng`, or `.cap`).
+3. Select **Entire PCAP** or **Specific IP address**. For an IP-specific comparison, enter the same target IP to filter both captures.
+4. Click **Analyze Traffic**.
+5. Review the assessment and evidence, the normalized comparison table, and detailed TCP/TLS tables.
 
-- overall capture size and flow count
-- likely existing vs new connection behavior
-- low-data vs stronger application activity
-- key TLS protocol indicators
-- a simple current assessment
+## Comparison methodology
 
-Detailed TCP, TLS, HTTP, flow, source, destination, and port statistics are
-still available inside expandable sections.
+Capture lengths and packet counts do **not** need to match. The comparison uses the observed capture duration to calculate packets/sec, TCP flows/sec, SYN/sec, TCP payload bytes/sec, TLS Application Data/sec, ClientHello/sec, and visible HTTP requests/sec. It also compares composition metrics such as SYN/ACK/PSH share, low-data-flow share, active-application-flow share, and bytes per flow.
 
+**Important:** v0.8 does not perform equal-packet subsampling. It compares full captures using time-normalized rates and behavior ratios. A very short capture, truncated capture, or capture missing return traffic may make the comparison unreliable. TCP flow counts and TLS indicators are inferred from captured evidence and are not definitive proof of a completed connection or an HTTP attack.
 
-## v0.5
-- Main traffic destination IP
-- Reverse DNS hostname when available
-- Destination concentration by packets, flows, and payload
-- Early attack conclusion with confidence and evidence
-- Dashboard glossary
+## Limitations
 
+- Attack classifications are heuristic, not a definitive malicious/benign verdict.
+- TLS Application Data indicates encrypted application traffic, not necessarily HTTP or a confirmed Layer 7 DDoS.
+- Packet-level TLS detection may miss records split across TCP segments.
+- Reverse DNS depends on available network/DNS resolution and is not proof of application ownership.
+- A peace-time capture should represent the same service, observation point, and ideally similar normal operating conditions.
+- The comparison currently treats each full capture as one interval rather than evaluating shorter time windows or statistically matched samples.
 
-## v0.6 classifier fix
-- SYN count alone no longer triggers a SYN Flood conclusion.
-- Application-bearing traffic is evaluated before SYN behavior.
-- SYN Flood now requires SYN-dominant traffic with little ACK, PSH, TLS application data, HTTP activity, and TCP payload.
-- Added Possible Web / Layer 7 DDoS classification when substantial application-bearing traffic is concentrated on one destination.
-- This change addresses the false SYN Flood classification observed in the known Web DDoS test capture.
+## Dependencies
 
+`requirements.txt` contains only the third-party packages imported by the application. The v0.8 comparison feature does not require additional packages.
 
-## Version 0.7
+## Version history
 
-Added scoped IP analysis.
-
-You can now choose:
-
-- **Entire PCAP**: analyze the complete capture.
-- **Specific IP address**: enter one IPv4 or IPv6 address and analyze only packets where that IP is the source or destination.
-
-The same TCP flow, payload, TLS/HTTP, destination, and attack-classification logic is then applied only to that selected traffic.
-
-
-## Version 0.8
-
-Added peace-time baseline comparison.
-
-### New analysis modes
-- Compare Peace Time vs Attack
-- Attack PCAP only
-
-### Comparison method
-PCAPs do not need to have the same packet count or duration. The tool compares normalized rates such as packets/sec, TCP flows/sec, SYN/sec, TCP payload bytes/sec, TLS Application Data/sec, ClientHello/sec, and HTTP requests/sec.
-
-It also compares behavioral composition such as SYN/ACK/PSH percentage, low-data flow percentage, active application flow percentage, and payload bytes per flow.
-
-If a specific IP is selected, both captures are filtered to that IP before the comparison.
+- **v0.8:** peace-time vs attack comparison, normalized rate/behavior table, baseline-aware attack assessment, retained IP filtering.
+- **v0.7:** optional specific-IP analysis.
+- **v0.6:** application evidence prioritized over SYN counts to reduce false SYN-flood conclusions.
+- **v0.5:** main destination, reverse DNS, concentration, early attack assessment and glossary.
+- **v0.4:** simplified overview and expandable technical details.
+- **v0.3:** directional TCP flow and TLS/HTTP evidence tracking.
